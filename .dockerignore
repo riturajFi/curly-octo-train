@@ -1,0 +1,5 @@
+node_modules/
+.git/
+.env
+whatsapp-session/
+npm-debug.log*
