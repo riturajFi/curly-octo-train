@@ -5,7 +5,7 @@ export const CONFIG = {
   // Can also be set with TARGET_NUMBER in Railway/local env.
   targetNumber: "91XXXXXXXXXX",
 
-  // Optional. If set, manual runs require ?token=... or x-run-token header.
+  // Optional. If set, /qr, /run, /logout, and /clear-locks require ?token=...
   manualRunToken: "",
 
   openaiModel: "gpt-4.1",

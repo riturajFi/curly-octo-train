@@ -1,9 +1,10 @@
 import http from "http";
 import "dotenv/config";
+import { readdir, rm } from "fs/promises";
+import path from "path";
 import OpenAI from "openai";
 import cron from "node-cron";
 import QRCode from "qrcode";
-import qrTerminal from "qrcode-terminal";
 import whatsappWeb from "whatsapp-web.js";
 import { CONFIG } from "./config.js";
 
@@ -16,6 +17,7 @@ const targetNumber = process.env.TARGET_NUMBER || CONFIG.targetNumber;
 const manualRunToken = process.env.MANUAL_RUN_TOKEN || CONFIG.manualRunToken;
 const readyWarnMs = Number(process.env.WHATSAPP_READY_WARN_MS || 90000);
 const diagnosticIntervalMs = Number(process.env.WHATSAPP_DIAGNOSTIC_INTERVAL_MS || 30000);
+const clearChromeLocksOnStart = process.env.CLEAR_CHROME_LOCKS === "true";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -59,6 +61,7 @@ function logStartupDiagnostics() {
     targetNumber: maskNumber(targetNumber),
     targetNumberHasPlus: Boolean(targetNumber?.includes("+")),
     manualRunProtected: Boolean(manualRunToken),
+    clearChromeLocksOnStart,
     timezone: CONFIG.timezone,
     cron: CONFIG.cron,
     openaiModel: CONFIG.openaiModel
@@ -71,6 +74,52 @@ function logStartupDiagnostics() {
   if (!targetNumber || targetNumber.includes("X") || targetNumber.includes("+")) {
     console.error("Invalid TARGET_NUMBER. Use country code only, no +. Example: 918917200633");
   }
+}
+
+async function findChromeLockFiles(dir, depth = 0) {
+  if (depth > 6) return [];
+
+  let entries = [];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.error(`Could not read ${dir}:`, error.message);
+    }
+    return [];
+  }
+
+  const lockFiles = [];
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      lockFiles.push(...await findChromeLockFiles(fullPath, depth + 1));
+      continue;
+    }
+
+    if (["SingletonLock", "SingletonSocket", "SingletonCookie"].includes(entry.name)) {
+      lockFiles.push(fullPath);
+    }
+  }
+
+  return lockFiles;
+}
+
+async function clearChromeLockFiles() {
+  const lockFiles = await findChromeLockFiles(sessionPath);
+
+  for (const lockFile of lockFiles) {
+    await rm(lockFile, { force: true });
+  }
+
+  console.log("Chrome profile lock cleanup:", JSON.stringify({
+    removed: lockFiles.length,
+    files: lockFiles
+  }));
+
+  return lockFiles;
 }
 
 async function logWhatsAppDiagnostics() {
@@ -95,28 +144,23 @@ async function logWhatsAppDiagnostics() {
   if (secondsSinceEvent * 1000 >= readyWarnMs) {
     console.error(
       "WhatsApp is still not ready. If it stays here, the saved session may be stale. " +
-      "Run `curl http://localhost:3000/logout`, stop with Ctrl+C, then run `npm start` again for a fresh QR."
+      "Run /logout, restart, then open /qr for a fresh QR."
     );
   }
 }
 
-whatsapp.on("qr", qr => {
+whatsapp.on("qr", async qr => {
   whatsappReady = false;
   markWhatsAppEvent("qr");
   lastQrDataUrl = "";
   lastQrAt = new Date().toISOString();
-  console.log("\nScan this QR from WhatsApp > Linked devices > Link a device:\n");
-  console.log("If terminal QR formatting is broken, open /qr in your browser.");
-  qrTerminal.generate(qr, { small: true });
+  console.log("WhatsApp QR ready. Open /qr in your browser.");
 
-  QRCode.toDataURL(qr, { margin: 2, scale: 8 })
-    .then(dataUrl => {
-      lastQrDataUrl = dataUrl;
-      console.log("QR web page is ready at /qr");
-    })
-    .catch(error => {
-      console.error("Failed to render QR web page image:", error);
-    });
+  try {
+    lastQrDataUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 8 });
+  } catch (error) {
+    console.error("Failed to render QR web page image:", error);
+  }
 });
 
 whatsapp.on("loading_screen", (percent, message) => {
@@ -132,6 +176,7 @@ whatsapp.on("authenticated", () => {
 whatsapp.on("ready", () => {
   whatsappReady = true;
   markWhatsAppEvent("ready");
+  lastQrDataUrl = "";
   console.log("WhatsApp client is ready.");
 });
 
@@ -208,8 +253,7 @@ Rules:
 - Return at least ${CONFIG.minCompanies} companies. If fewer than
   ${CONFIG.minCompanies} strong matches are available from the last 7 days,
   expand to the last 30 days.
-- Search broadly across multiple sources before finalizing. Do not stop after
-  finding only a few companies.
+- Search broadly across multiple sources before finalizing.
 - Prefer India-based companies first, then global remote-friendly startups.
 - Prefer small and mid-size startups, roughly pre-seed to Series B.
 - Prefer teams likely to be hiring hands-on engineers after funding.
@@ -222,8 +266,6 @@ Rules:
 - Exclude biotech, pharma, healthcare drug discovery, climate hardware, EV,
   manufacturing, real estate, food, fashion, crypto tokens, lending-only NBFCs,
   fund launches, and old articles unless there is a clear AI/software hiring fit.
-- Categorize rounds as pre_seed, seed, series_a, series_b, series_c, growth, debt, grant, or undisclosed.
-- Rank by "should I apply/outreach?" priority for this candidate.
 - Keep the final message very short.
 - Return WhatsApp-ready text only.
 - No markdown tables.
@@ -248,8 +290,8 @@ async function sendWhatsAppMessage(text) {
     throw new Error("WhatsApp is not ready. Scan the QR first.");
   }
 
-  if (!targetNumber || targetNumber.includes("X")) {
-    throw new Error("Set TARGET_NUMBER or config.targetNumber before sending.");
+  if (!targetNumber || targetNumber.includes("X") || targetNumber.includes("+")) {
+    throw new Error("Set TARGET_NUMBER without +, spaces, or placeholders. Example: 918917200633");
   }
 
   await whatsapp.sendMessage(`${targetNumber}@c.us`, text.slice(0, 3500));
@@ -261,20 +303,16 @@ async function runAgent() {
   }
 
   if (!whatsappReady) {
-    throw new Error("WhatsApp is not ready. Scan the QR first.");
-  }
-
-  if (!targetNumber || targetNumber.includes("X") || targetNumber.includes("+")) {
-    throw new Error("Set TARGET_NUMBER without +, spaces, or placeholders. Example: 918917200633");
+    throw new Error("WhatsApp is not ready. Open /qr and scan first.");
   }
 
   agentRunning = true;
-  console.log("Running VC funding research agent...");
+  console.log("Running funded-company research agent...");
 
   try {
     const report = await researchFundingNews();
     await sendWhatsAppMessage(report);
-    console.log("Daily VC report sent.");
+    console.log("Research report sent.");
     return { ok: true };
   } catch (error) {
     console.error("Agent failed:", error);
@@ -282,6 +320,11 @@ async function runAgent() {
   } finally {
     agentRunning = false;
   }
+}
+
+function isChromeProfileLockError(error) {
+  return String(error?.message || error).includes("profile appears to be in use") ||
+    String(error?.message || error).includes("SingletonLock");
 }
 
 function isAuthorized(req, url) {
@@ -301,8 +344,8 @@ function sendQrPage(res, url) {
   const content = whatsappReady
     ? `
       <h1>WhatsApp is ready</h1>
-      <p>The bot is logged in. You can trigger a manual run now.</p>
-      <a href="${runUrl}">Run now</a>
+      <p>The bot is logged in.</p>
+      <a href="${runUrl}">Run research now</a>
     `
     : lastQrDataUrl
       ? `
@@ -404,7 +447,22 @@ function startHealthServer() {
       }
 
       await whatsapp.logout();
-      sendJson(res, 200, { ok: true, message: "Logged out. Restart npm start to get a fresh QR." });
+      sendJson(res, 200, { ok: true, message: "Logged out. Restart to get a fresh QR." });
+      return;
+    }
+
+    if (url.pathname === "/clear-locks") {
+      if (!isAuthorized(req, url)) {
+        sendJson(res, 401, { ok: false, error: "Invalid token." });
+        return;
+      }
+
+      const removed = await clearChromeLockFiles();
+      sendJson(res, 200, {
+        ok: true,
+        removed: removed.length,
+        message: "Restart the Railway service after clearing locks."
+      });
       return;
     }
 
@@ -416,6 +474,8 @@ function startHealthServer() {
       targetConfigured: Boolean(targetNumber && !targetNumber.includes("X") && !targetNumber.includes("+")),
       qrAvailable: Boolean(lastQrDataUrl),
       qrUrl: manualRunToken ? "/qr?token=YOUR_TOKEN" : "/qr",
+      runUrl: manualRunToken ? "/run?token=YOUR_TOKEN" : "/run",
+      clearLocksUrl: manualRunToken ? "/clear-locks?token=YOUR_TOKEN" : "/clear-locks",
       time: new Date().toISOString()
     });
   }).listen(port, () => {
@@ -434,9 +494,20 @@ process.on("uncaughtException", error => {
 
 logStartupDiagnostics();
 
+if (clearChromeLocksOnStart) {
+  await clearChromeLockFiles();
+}
+
 whatsapp.initialize().catch(error => {
   markWhatsAppEvent("initialize_failed");
   console.error("WhatsApp initialize failed:", error);
+
+  if (isChromeProfileLockError(error)) {
+    console.error(
+      "Chromium profile is locked. Make sure Railway has only one active instance. " +
+      "Then set CLEAR_CHROME_LOCKS=true for one redeploy, or call /clear-locks and restart."
+    );
+  }
 });
 
 setInterval(logWhatsAppDiagnostics, diagnosticIntervalMs).unref();
