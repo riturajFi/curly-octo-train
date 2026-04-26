@@ -8,11 +8,14 @@ import QRCode from "qrcode";
 import whatsappWeb from "whatsapp-web.js";
 import { CONFIG } from "./config.js";
 
-const { Client, LocalAuth } = whatsappWeb;
+const { Client, LocalAuth, NoAuth } = whatsappWeb;
 
 const sessionPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? `${process.env.RAILWAY_VOLUME_MOUNT_PATH}/whatsapp-session`
   : "./whatsapp-session";
+const isRailway = Boolean(process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+const persistWhatsAppSession = process.env.PERSIST_WHATSAPP_SESSION === "true" ||
+  (!isRailway && process.env.PERSIST_WHATSAPP_SESSION !== "false");
 const targetNumber = process.env.TARGET_NUMBER || CONFIG.targetNumber;
 const manualRunToken = process.env.MANUAL_RUN_TOKEN || CONFIG.manualRunToken;
 const readyWarnMs = Number(process.env.WHATSAPP_READY_WARN_MS || 90000);
@@ -24,7 +27,9 @@ const openai = new OpenAI({
 });
 
 const whatsapp = new Client({
-  authStrategy: new LocalAuth({ dataPath: sessionPath }),
+  authStrategy: persistWhatsAppSession
+    ? new LocalAuth({ dataPath: sessionPath })
+    : new NoAuth(),
   puppeteer: {
     headless: true,
     args: [
@@ -57,6 +62,8 @@ function maskNumber(number) {
 function logStartupDiagnostics() {
   console.log("Startup config:", JSON.stringify({
     sessionPath,
+    isRailway,
+    persistWhatsAppSession,
     hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY),
     targetNumber: maskNumber(targetNumber),
     targetNumberHasPlus: Boolean(targetNumber?.includes("+")),
@@ -495,7 +502,11 @@ process.on("uncaughtException", error => {
 logStartupDiagnostics();
 
 if (clearChromeLocksOnStart) {
-  await clearChromeLockFiles();
+  if (persistWhatsAppSession) {
+    await clearChromeLockFiles();
+  } else {
+    console.log("Skipping Chrome lock cleanup because PERSIST_WHATSAPP_SESSION is false.");
+  }
 }
 
 whatsapp.initialize().catch(error => {

@@ -53,13 +53,17 @@ Set env vars:
 OPENAI_API_KEY=sk-your-key
 TARGET_NUMBER=918917200633
 MANUAL_RUN_TOKEN=some-long-random-string
+PERSIST_WHATSAPP_SESSION=false
 ```
 
-Attach a Railway volume. The app stores WhatsApp login under:
+By default, Railway should use:
 
 ```text
-$RAILWAY_VOLUME_MOUNT_PATH/whatsapp-session
+PERSIST_WHATSAPP_SESSION=false
 ```
+
+This avoids Chromium profile lock errors. You will need to scan the QR again
+after a fresh Railway container start.
 
 Open:
 
@@ -80,3 +84,11 @@ CLEAR_CHROME_LOCKS=true
 ```
 
 Remove it after the app starts normally.
+
+Persistent Railway sessions are possible, but they can hit Chromium profile
+locks during redeploys. Only enable this if you have a volume attached and are
+okay handling lock recovery:
+
+```text
+PERSIST_WHATSAPP_SESSION=true
+```
