@@ -32,26 +32,47 @@ const whatsapp = new Client({
 });
 
 let whatsappReady = false;
+let whatsappState = "starting";
 let agentRunning = false;
 
 whatsapp.on("qr", qr => {
+  whatsappReady = false;
+  whatsappState = "qr";
   console.log("\nScan this QR from WhatsApp > Linked devices > Link a device:\n");
   qrcode.generate(qr, { small: true });
 });
 
+whatsapp.on("loading_screen", (percent, message) => {
+  whatsappState = "loading";
+  console.log(`WhatsApp loading ${percent}%: ${message}`);
+});
+
+whatsapp.on("authenticated", () => {
+  whatsappState = "authenticated";
+  console.log("WhatsApp authenticated. Waiting for ready...");
+});
+
 whatsapp.on("ready", () => {
   whatsappReady = true;
+  whatsappState = "ready";
   console.log("WhatsApp client is ready.");
 });
 
 whatsapp.on("auth_failure", message => {
   whatsappReady = false;
+  whatsappState = "auth_failure";
   console.error("WhatsApp auth failed:", message);
 });
 
 whatsapp.on("disconnected", reason => {
   whatsappReady = false;
+  whatsappState = "disconnected";
   console.error("WhatsApp disconnected:", reason);
+});
+
+whatsapp.on("change_state", state => {
+  whatsappState = state;
+  console.log("WhatsApp state changed:", state);
 });
 
 async function researchFundingNews() {
@@ -61,19 +82,34 @@ async function researchFundingNews() {
     model: CONFIG.openaiModel,
     tools: [{ type: "web_search_preview" }],
     input: `
-You are a VC funding research agent.
+You are a job-search funding research agent for a software engineer.
 
-Find startup funding news announced in the last 24 hours.
+Goal:
+Find recently funded startups that are likely to hire AI engineers, backend
+engineers, full-stack engineers, agentic AI engineers, or LLM application
+engineers.
+
+Candidate profile:
+- 1.5+ years software engineering experience at Pine Labs.
+- Built production AI evaluation platform with LangChain, OpenAI API,
+  PostgreSQL, queues, scheduled jobs, cost controls, and reporting.
+- Backend/full-stack experience with Python, FastAPI, gRPC, TypeScript,
+  React, Next.js, Electron, PostgreSQL, Redis, Docker.
+- Strong LLM systems experience: RAG, LangGraph, multi-agent systems,
+  OpenAI API, LLM evaluation, autonomous coding agents, observability.
+- India-based. Prefer Bengaluru, India remote, or India-friendly teams.
 
 Search for:
-- funding announced today
-- startup raised seed funding
-- startup raised pre-seed funding
-- startup raised Series A
-- startup raised Series B
-- latest venture funding news
-- India startup funding today
-- global startup funding today
+- India AI startup funding today
+- India SaaS startup raised seed funding
+- India startup raised pre-seed AI funding
+- India startup raised Series A AI funding
+- AI agent startup raised funding
+- developer tools startup raised funding
+- full-stack engineering hiring startup funding
+- LLM startup raised seed funding
+- B2B SaaS startup raised funding India
+- fintech AI startup raised funding India
 
 Prefer company blogs, investor blogs, TechCrunch, Crunchbase News, FinSMEs,
 BusinessWire, PR Newswire, GlobeNewswire, Inc42, YourStory, Entrackr,
@@ -81,22 +117,37 @@ VCCircle, and EU-Startups.
 
 Rules:
 - Include only companies that announced funding recently.
-- Exclude fund launches and old articles.
+- Prefer announcements from the last 7 days. If there are enough results from
+  the last 24 hours, use only those.
+- Prefer India-based companies first, then global remote-friendly startups.
+- Prefer small and mid-size startups, roughly pre-seed to Series B.
+- Prefer teams likely to be hiring hands-on engineers after funding.
+- Prefer AI, LLM apps, agents, developer tools, B2B SaaS, fintech infra,
+  enterprise software, data/analytics, workflow automation, and full-stack
+  product engineering companies.
+- Exclude huge companies and labs that are unlikely outreach targets, such as
+  Anthropic, OpenAI, Google, Meta, Microsoft, Amazon, Apple, NVIDIA, xAI, Mistral,
+  Perplexity, and similar late-stage giants.
+- Exclude biotech, pharma, healthcare drug discovery, climate hardware, EV,
+  manufacturing, real estate, food, fashion, crypto tokens, lending-only NBFCs,
+  fund launches, and old articles unless there is a clear AI/software hiring fit.
 - Categorize rounds as pre_seed, seed, series_a, series_b, series_c, growth, debt, grant, or undisclosed.
-- Rank by outreach priority.
+- Rank by "should I apply/outreach?" priority for this candidate.
 - Keep it short.
 - Return WhatsApp-ready text only.
 - No markdown tables.
 
 Output format:
 
-VC Funding Brief - ${today}
+Funded Companies To Apply To - ${today}
 
 1. Company - Round - Amount
+Location:
 Sector:
 Investors:
-Why reach out:
-Angle:
+Why it fits me:
+Likely roles:
+Outreach angle:
 Source:
 
 Limit to top ${CONFIG.maxCompanies} companies.
@@ -121,6 +172,14 @@ async function sendWhatsAppMessage(text) {
 async function runAgent() {
   if (agentRunning) {
     throw new Error("Agent is already running.");
+  }
+
+  if (!whatsappReady) {
+    throw new Error("WhatsApp is not ready. Scan the QR first.");
+  }
+
+  if (!targetNumber || targetNumber.includes("X") || targetNumber.includes("+")) {
+    throw new Error("Set TARGET_NUMBER without +, spaces, or placeholders. Example: 918917200633");
   }
 
   agentRunning = true;
@@ -160,12 +219,20 @@ function startHealthServer() {
       return;
     }
 
+    if (url.pathname === "/logout") {
+      await whatsapp.logout();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, message: "Logged out. Restart npm start to get a fresh QR." }));
+      return;
+    }
+
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       ok: true,
       whatsappReady,
+      whatsappState,
       agentRunning,
-      targetConfigured: Boolean(targetNumber && !targetNumber.includes("X")),
+      targetConfigured: Boolean(targetNumber && !targetNumber.includes("X") && !targetNumber.includes("+")),
       time: new Date().toISOString()
     }));
   }).listen(port, () => {

@@ -62,6 +62,20 @@ If `MANUAL_RUN_TOKEN` is set:
 curl "http://localhost:3000/run?token=some-long-random-string"
 ```
 
+If no QR appears, the app may be trying to reuse an old WhatsApp session. Wait
+until the status says `ready`. If it does not become ready, force logout and
+restart:
+
+```bash
+curl http://localhost:3000/logout
+```
+
+Then stop `npm start` with `Ctrl+C` and run it again:
+
+```bash
+npm start
+```
+
 ## Deploy To Railway
 
 1. Push this repo to GitHub.
