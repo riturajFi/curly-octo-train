@@ -9,5 +9,6 @@ export const CONFIG = {
   manualRunToken: "",
 
   openaiModel: "gpt-4.1",
+  minCompanies: 10,
   maxCompanies: 12
 };

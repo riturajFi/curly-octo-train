@@ -13,6 +13,8 @@ const sessionPath = process.env.RAILWAY_VOLUME_MOUNT_PATH
   : "./whatsapp-session";
 const targetNumber = process.env.TARGET_NUMBER || CONFIG.targetNumber;
 const manualRunToken = process.env.MANUAL_RUN_TOKEN || CONFIG.manualRunToken;
+const readyWarnMs = Number(process.env.WHATSAPP_READY_WARN_MS || 90000);
+const diagnosticIntervalMs = Number(process.env.WHATSAPP_DIAGNOSTIC_INTERVAL_MS || 30000);
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -34,45 +36,110 @@ const whatsapp = new Client({
 let whatsappReady = false;
 let whatsappState = "starting";
 let agentRunning = false;
+let lastWhatsAppEventAt = Date.now();
+
+function markWhatsAppEvent(state) {
+  whatsappState = state;
+  lastWhatsAppEventAt = Date.now();
+}
+
+function maskNumber(number) {
+  if (!number) return "missing";
+  if (number.includes("X")) return "placeholder";
+  return `${number.slice(0, 2)}***${number.slice(-4)}`;
+}
+
+function logStartupDiagnostics() {
+  console.log("Startup config:", JSON.stringify({
+    sessionPath,
+    hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY),
+    targetNumber: maskNumber(targetNumber),
+    targetNumberHasPlus: Boolean(targetNumber?.includes("+")),
+    manualRunProtected: Boolean(manualRunToken),
+    timezone: CONFIG.timezone,
+    cron: CONFIG.cron,
+    openaiModel: CONFIG.openaiModel
+  }));
+
+  if (!process.env.OPENAI_API_KEY) {
+    console.error("Missing OPENAI_API_KEY. Add it to .env before running /run.");
+  }
+
+  if (!targetNumber || targetNumber.includes("X") || targetNumber.includes("+")) {
+    console.error("Invalid TARGET_NUMBER. Use country code only, no +. Example: 918917200633");
+  }
+}
+
+async function logWhatsAppDiagnostics() {
+  if (whatsappReady) return;
+
+  const secondsSinceEvent = Math.round((Date.now() - lastWhatsAppEventAt) / 1000);
+  let browserState = "unavailable";
+
+  try {
+    browserState = await whatsapp.getState();
+  } catch (error) {
+    browserState = `getState failed: ${error.message}`;
+  }
+
+  console.log("WhatsApp diagnostic:", JSON.stringify({
+    whatsappState,
+    browserState,
+    secondsSinceLastEvent: secondsSinceEvent,
+    sessionPath
+  }));
+
+  if (secondsSinceEvent * 1000 >= readyWarnMs) {
+    console.error(
+      "WhatsApp is still not ready. If it stays here, the saved session may be stale. " +
+      "Run `curl http://localhost:3000/logout`, stop with Ctrl+C, then run `npm start` again for a fresh QR."
+    );
+  }
+}
 
 whatsapp.on("qr", qr => {
   whatsappReady = false;
-  whatsappState = "qr";
+  markWhatsAppEvent("qr");
   console.log("\nScan this QR from WhatsApp > Linked devices > Link a device:\n");
   qrcode.generate(qr, { small: true });
 });
 
 whatsapp.on("loading_screen", (percent, message) => {
-  whatsappState = "loading";
+  markWhatsAppEvent("loading");
   console.log(`WhatsApp loading ${percent}%: ${message}`);
 });
 
 whatsapp.on("authenticated", () => {
-  whatsappState = "authenticated";
+  markWhatsAppEvent("authenticated");
   console.log("WhatsApp authenticated. Waiting for ready...");
 });
 
 whatsapp.on("ready", () => {
   whatsappReady = true;
-  whatsappState = "ready";
+  markWhatsAppEvent("ready");
   console.log("WhatsApp client is ready.");
 });
 
 whatsapp.on("auth_failure", message => {
   whatsappReady = false;
-  whatsappState = "auth_failure";
+  markWhatsAppEvent("auth_failure");
   console.error("WhatsApp auth failed:", message);
 });
 
 whatsapp.on("disconnected", reason => {
   whatsappReady = false;
-  whatsappState = "disconnected";
+  markWhatsAppEvent("disconnected");
   console.error("WhatsApp disconnected:", reason);
 });
 
 whatsapp.on("change_state", state => {
-  whatsappState = state;
+  markWhatsAppEvent(state);
   console.log("WhatsApp state changed:", state);
+});
+
+whatsapp.on("error", error => {
+  markWhatsAppEvent("error");
+  console.error("WhatsApp client error:", error);
 });
 
 async function researchFundingNews() {
@@ -85,9 +152,9 @@ async function researchFundingNews() {
 You are a job-search funding research agent for a software engineer.
 
 Goal:
-Find recently funded startups that are likely to hire AI engineers, backend
-engineers, full-stack engineers, agentic AI engineers, or LLM application
-engineers.
+Find ${CONFIG.minCompanies}-${CONFIG.maxCompanies} recently funded startups
+that are likely to hire AI engineers, backend engineers, full-stack engineers,
+agentic AI engineers, or LLM application engineers.
 
 Candidate profile:
 - 1.5+ years software engineering experience at Pine Labs.
@@ -110,6 +177,10 @@ Search for:
 - LLM startup raised seed funding
 - B2B SaaS startup raised funding India
 - fintech AI startup raised funding India
+- developer tools funding announced
+- enterprise AI startup funding
+- workflow automation startup raised funding
+- recently funded startups hiring engineers India
 
 Prefer company blogs, investor blogs, TechCrunch, Crunchbase News, FinSMEs,
 BusinessWire, PR Newswire, GlobeNewswire, Inc42, YourStory, Entrackr,
@@ -119,6 +190,11 @@ Rules:
 - Include only companies that announced funding recently.
 - Prefer announcements from the last 7 days. If there are enough results from
   the last 24 hours, use only those.
+- Return at least ${CONFIG.minCompanies} companies. If fewer than
+  ${CONFIG.minCompanies} strong matches are available from the last 7 days,
+  expand to the last 30 days.
+- Search broadly across multiple sources before finalizing. Do not stop after
+  finding only a few companies.
 - Prefer India-based companies first, then global remote-friendly startups.
 - Prefer small and mid-size startups, roughly pre-seed to Series B.
 - Prefer teams likely to be hiring hands-on engineers after funding.
@@ -133,24 +209,19 @@ Rules:
   fund launches, and old articles unless there is a clear AI/software hiring fit.
 - Categorize rounds as pre_seed, seed, series_a, series_b, series_c, growth, debt, grant, or undisclosed.
 - Rank by "should I apply/outreach?" priority for this candidate.
-- Keep it short.
+- Keep the final message very short.
 - Return WhatsApp-ready text only.
 - No markdown tables.
+- Do not include sectors, locations, reasoning, likely roles, outreach angles,
+  descriptions, or extra commentary.
 
 Output format:
 
 Funded Companies To Apply To - ${today}
 
-1. Company - Round - Amount
-Location:
-Sector:
-Investors:
-Why it fits me:
-Likely roles:
-Outreach angle:
-Source:
+1. Company - Round/Amount - VC/investor names
 
-Limit to top ${CONFIG.maxCompanies} companies.
+Return ${CONFIG.minCompanies}-${CONFIG.maxCompanies} companies.
 `
   });
 
@@ -240,7 +311,22 @@ function startHealthServer() {
   });
 }
 
-whatsapp.initialize();
+process.on("unhandledRejection", error => {
+  console.error("Unhandled promise rejection:", error);
+});
+
+process.on("uncaughtException", error => {
+  console.error("Uncaught exception:", error);
+});
+
+logStartupDiagnostics();
+
+whatsapp.initialize().catch(error => {
+  markWhatsAppEvent("initialize_failed");
+  console.error("WhatsApp initialize failed:", error);
+});
+
+setInterval(logWhatsAppDiagnostics, diagnosticIntervalMs).unref();
 
 cron.schedule(CONFIG.cron, runAgent, {
   timezone: CONFIG.timezone
