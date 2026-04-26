@@ -2,7 +2,8 @@ import http from "http";
 import "dotenv/config";
 import OpenAI from "openai";
 import cron from "node-cron";
-import qrcode from "qrcode-terminal";
+import QRCode from "qrcode";
+import qrTerminal from "qrcode-terminal";
 import whatsappWeb from "whatsapp-web.js";
 import { CONFIG } from "./config.js";
 
@@ -37,6 +38,8 @@ let whatsappReady = false;
 let whatsappState = "starting";
 let agentRunning = false;
 let lastWhatsAppEventAt = Date.now();
+let lastQrDataUrl = "";
+let lastQrAt = "";
 
 function markWhatsAppEvent(state) {
   whatsappState = state;
@@ -100,8 +103,20 @@ async function logWhatsAppDiagnostics() {
 whatsapp.on("qr", qr => {
   whatsappReady = false;
   markWhatsAppEvent("qr");
+  lastQrDataUrl = "";
+  lastQrAt = new Date().toISOString();
   console.log("\nScan this QR from WhatsApp > Linked devices > Link a device:\n");
-  qrcode.generate(qr, { small: true });
+  console.log("If terminal QR formatting is broken, open /qr in your browser.");
+  qrTerminal.generate(qr, { small: true });
+
+  QRCode.toDataURL(qr, { margin: 2, scale: 8 })
+    .then(dataUrl => {
+      lastQrDataUrl = dataUrl;
+      console.log("QR web page is ready at /qr");
+    })
+    .catch(error => {
+      console.error("Failed to render QR web page image:", error);
+    });
 });
 
 whatsapp.on("loading_screen", (percent, message) => {
@@ -269,45 +284,143 @@ async function runAgent() {
   }
 }
 
+function isAuthorized(req, url) {
+  if (!manualRunToken) return true;
+  const token = url.searchParams.get("token") || req.headers["x-run-token"];
+  return token === manualRunToken;
+}
+
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function sendQrPage(res, url) {
+  const token = url.searchParams.get("token");
+  const runUrl = manualRunToken && token ? `/run?token=${encodeURIComponent(token)}` : "/run";
+  const content = whatsappReady
+    ? `
+      <h1>WhatsApp is ready</h1>
+      <p>The bot is logged in. You can trigger a manual run now.</p>
+      <a href="${runUrl}">Run now</a>
+    `
+    : lastQrDataUrl
+      ? `
+        <h1>Scan WhatsApp QR</h1>
+        <p>WhatsApp -> Linked devices -> Link a device</p>
+        <img src="${lastQrDataUrl}" alt="WhatsApp login QR" />
+        <p class="muted">Generated at ${lastQrAt}. This page refreshes automatically.</p>
+      `
+      : `
+        <h1>Waiting for QR</h1>
+        <p>No QR has been generated yet. Keep this page open.</p>
+        <p class="muted">Current state: ${whatsappState}</p>
+      `;
+
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(`<!doctype html>
+<html>
+  <head>
+    <title>WhatsApp QR</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="refresh" content="5" />
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f7f4;
+        color: #151515;
+      }
+      main {
+        width: min(92vw, 460px);
+        text-align: center;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 28px;
+      }
+      p {
+        margin: 8px 0;
+        font-size: 15px;
+      }
+      img {
+        width: min(82vw, 340px);
+        height: auto;
+        margin: 18px 0;
+        background: white;
+        border: 1px solid #ddd;
+      }
+      a {
+        display: inline-block;
+        margin-top: 12px;
+        color: #0b5cad;
+      }
+      .muted {
+        color: #666;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>${content}</main>
+  </body>
+</html>`);
+}
+
 function startHealthServer() {
   const port = process.env.PORT || 3000;
 
   http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    if (url.pathname === "/run") {
-      const token = url.searchParams.get("token") || req.headers["x-run-token"];
+    if (url.pathname === "/qr") {
+      if (!isAuthorized(req, url)) {
+        sendJson(res, 401, { ok: false, error: "Invalid token." });
+        return;
+      }
 
-      if (manualRunToken && token !== manualRunToken) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "Invalid manual run token." }));
+      sendQrPage(res, url);
+      return;
+    }
+
+    if (url.pathname === "/run") {
+      if (!isAuthorized(req, url)) {
+        sendJson(res, 401, { ok: false, error: "Invalid token." });
         return;
       }
 
       const result = await runAgent();
-      res.writeHead(result.ok ? 200 : 500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result));
+      sendJson(res, result.ok ? 200 : 500, result);
       return;
     }
 
     if (url.pathname === "/logout") {
+      if (!isAuthorized(req, url)) {
+        sendJson(res, 401, { ok: false, error: "Invalid token." });
+        return;
+      }
+
       await whatsapp.logout();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, message: "Logged out. Restart npm start to get a fresh QR." }));
+      sendJson(res, 200, { ok: true, message: "Logged out. Restart npm start to get a fresh QR." });
       return;
     }
 
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       ok: true,
       whatsappReady,
       whatsappState,
       agentRunning,
       targetConfigured: Boolean(targetNumber && !targetNumber.includes("X") && !targetNumber.includes("+")),
+      qrAvailable: Boolean(lastQrDataUrl),
+      qrUrl: manualRunToken ? "/qr?token=YOUR_TOKEN" : "/qr",
       time: new Date().toISOString()
-    }));
+    });
   }).listen(port, () => {
     console.log(`Health server listening on ${port}`);
+    console.log(`QR page: ${manualRunToken ? "/qr?token=YOUR_TOKEN" : "/qr"}`);
   });
 }
 

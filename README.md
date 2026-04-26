@@ -44,6 +44,12 @@ Linked devices -> Link a device
 
 The local session is stored in `./whatsapp-session`.
 
+If the terminal QR is hard to scan, open the browser QR page:
+
+```text
+http://localhost:3000/qr
+```
+
 Check status:
 
 ```bash
@@ -60,6 +66,12 @@ If `MANUAL_RUN_TOKEN` is set:
 
 ```bash
 curl "http://localhost:3000/run?token=some-long-random-string"
+```
+
+The QR page also needs the token:
+
+```text
+http://localhost:3000/qr?token=some-long-random-string
 ```
 
 If no QR appears, the app may be trying to reuse an old WhatsApp session. Wait
@@ -88,6 +100,18 @@ npm start
 8. Open Railway logs and scan the QR.
 
 Railway exposes the volume path through `RAILWAY_VOLUME_MOUNT_PATH`, so the app stores the WhatsApp session at `/data/whatsapp-session`.
+
+If the Railway logs QR is not scannable, open the QR page in your browser:
+
+```text
+https://your-app.up.railway.app/qr
+```
+
+If `MANUAL_RUN_TOKEN` is set:
+
+```text
+https://your-app.up.railway.app/qr?token=some-long-random-string
+```
 
 After scanning, open the Railway public URL to check status:
 
